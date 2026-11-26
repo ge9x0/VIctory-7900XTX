@@ -738,6 +738,8 @@ pub(crate) fn view_whole(at: usize, len: usize) -> bool {
         && info.Type == mem::MEM_MAPPED
         && info.Protect == mem::PAGE_READWRITE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+}
+
 /// The whole stretch of views around `[at, at + len)` that follow one
 /// another in memory and in one section alike, if the range is one run of a
 /// section ([`Cover::Run`]): its first address, its bytes, the section and
