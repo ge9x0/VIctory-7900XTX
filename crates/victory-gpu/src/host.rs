@@ -2154,11 +2154,11 @@ cbuffer Span : register(b0) {
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
 };
-ByteAddressBuffer now : register(t0);
+StructuredBuffer<uint> now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
+RWStructuredBuffer<uint> hashes : register(u0);
+RWStructuredBuffer<uint> differs : register(u1);
 groupshared uint4 parts[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -2174,14 +2174,14 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     // Eight loads at once: one after the other, each waits for memory.
     [loop]
     for (; at + 7168u < hi; at += 8192u) {
-        uint4 v0 = now.Load4(at + 0u);
-        uint4 v1 = now.Load4(at + 1024u);
-        uint4 v2 = now.Load4(at + 2048u);
-        uint4 v3 = now.Load4(at + 3072u);
-        uint4 v4 = now.Load4(at + 4096u);
-        uint4 v5 = now.Load4(at + 5120u);
-        uint4 v6 = now.Load4(at + 6144u);
-        uint4 v7 = now.Load4(at + 7168u);
+        uint4 v0 = uint4(now[(at + 0u) / 4], now[(at + 0u) / 4 + 1], now[(at + 0u) / 4 + 2], now[(at + 0u) / 4 + 3]);
+        uint4 v1 = uint4(now[(at + 1024u) / 4], now[(at + 1024u) / 4 + 1], now[(at + 1024u) / 4 + 2], now[(at + 1024u) / 4 + 3]);
+        uint4 v2 = uint4(now[(at + 2048u) / 4], now[(at + 2048u) / 4 + 1], now[(at + 2048u) / 4 + 2], now[(at + 2048u) / 4 + 3]);
+        uint4 v3 = uint4(now[(at + 3072u) / 4], now[(at + 3072u) / 4 + 1], now[(at + 3072u) / 4 + 2], now[(at + 3072u) / 4 + 3]);
+        uint4 v4 = uint4(now[(at + 4096u) / 4], now[(at + 4096u) / 4 + 1], now[(at + 4096u) / 4 + 2], now[(at + 4096u) / 4 + 3]);
+        uint4 v5 = uint4(now[(at + 5120u) / 4], now[(at + 5120u) / 4 + 1], now[(at + 5120u) / 4 + 2], now[(at + 5120u) / 4 + 3]);
+        uint4 v6 = uint4(now[(at + 6144u) / 4], now[(at + 6144u) / 4 + 1], now[(at + 6144u) / 4 + 2], now[(at + 6144u) / 4 + 3]);
+        uint4 v7 = uint4(now[(at + 7168u) / 4], now[(at + 7168u) / 4 + 1], now[(at + 7168u) / 4 + 2], now[(at + 7168u) / 4 + 3]);
         h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
         h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
@@ -2201,7 +2201,7 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     [loop]
     for (; at < hi; at += 1024u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = (h ^ uint4(now[(at) / 4], now[(at) / 4 + 1], now[(at) / 4 + 2], now[(at) / 4 + 3])) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
     parts[thread] = h;
@@ -2216,12 +2216,12 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+        differs[(out_at + id.x * 4u) / 4] = (folded << 1u) | (any(h != uint4(hashes[(piece * 16u) / 4], hashes[(piece * 16u) / 4 + 1], hashes[(piece * 16u) / 4 + 2], hashes[(piece * 16u) / 4 + 3])) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) { uint4 _v = h; hashes[(piece * 16u) / 4] = _v.x; hashes[(piece * 16u) / 4 + 1] = _v.y; hashes[(piece * 16u) / 4 + 2] = _v.z; hashes[(piece * 16u) / 4 + 3] = _v.w; };
     } else {
-        hashes.Store4(piece * 16u, h);
+        { uint4 _v = h; hashes[(piece * 16u) / 4] = _v.x; hashes[(piece * 16u) / 4 + 1] = _v.y; hashes[(piece * 16u) / 4 + 2] = _v.z; hashes[(piece * 16u) / 4 + 3] = _v.w; };
     }
 }
 "#;

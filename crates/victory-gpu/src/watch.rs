@@ -3122,8 +3122,21 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    // Local (Wine): a VirtualQuery of a large write-watched region walks its
+    // pages under the address-space lock (~13 us, 6,600 a frame in the world:
+    // ~85 ms, and the other threads' faults and askings wait behind it). A
+    // committed region's end is kept for a moment on this thread: the blocks
+    // after this one in it are answered without asking again.
+    thread_local! {
+        static COMMITTED: std::cell::Cell<(usize, usize, Option<std::time::Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
+    }
+    if let (from, until, Some(at)) = COMMITTED.get() {
+        if block >= from && block < until && at.elapsed() < std::time::Duration::from_millis(2) {
+            return block;
+        }
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -3131,6 +3144,10 @@ fn uncommitted_end(block: usize) -> usize {
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
+        if n != 0 && info.State == MEM_COMMIT && std::env::var_os("VICTORY_NO_QUERY_CACHE").is_none() {
+            let end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+            COMMITTED.set((block, end, Some(std::time::Instant::now())));
+        }
         block
     }
 }

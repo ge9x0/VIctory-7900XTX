@@ -496,6 +496,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             return r;
         }
     }
+    // Local: `VICTORY_SKIP_BREAKS=0x4da6315,...` – title asserts (int3, offsets
+    // in the title image) passed over; execution goes on after the int3.
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { skip_break(info) } {
+        return -1;
+    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
@@ -1478,4 +1484,37 @@ mod tests {
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }
+}
+
+
+unsafe fn skip_break(info: *const EXCEPTION_POINTERS) -> bool {
+    static LIST: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_BREAKS").unwrap_or_default().split(',')
+            .filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    // SAFETY: valid exception pointers from the system.
+    let (rec, ctx) = unsafe { (&*(*info).ExceptionRecord, (*info).ContextRecord) };
+    if rec.ExceptionCode as u32 != 0x8000_0003 || ctx.is_null() {
+        return false;
+    }
+    let at = rec.ExceptionAddress as usize;
+    for &off in list {
+        let base = at.wrapping_sub(off);
+        // the title image: 64 KiB aligned, starts with "MZ", an int3 at `at`
+        // SAFETY: the base is checked to be readable by its alignment and the image mapping; at holds the int3 just executed.
+        if base % 0x10000 == 0 && base != 0 && unsafe { *(at as *const u8) } == 0xcc && unsafe { *(base as *const u16) } == 0x5a4d {
+            // SAFETY: the thread's context, resumed after the int3.
+            unsafe { (*ctx).Rip = at as u64 + 1 };
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                tracing::warn!(offset = format_args!("{off:#x}"), "title int3 passed over (VICTORY_SKIP_BREAKS)");
+            }
+            return true;
+        }
+    }
+    false
 }
