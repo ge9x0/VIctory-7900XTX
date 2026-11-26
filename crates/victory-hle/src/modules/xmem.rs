@@ -68,6 +68,11 @@ const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+fn no_write_watch() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("VICTORY_NO_WRITE_WATCH").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
@@ -133,7 +138,12 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        // Local (Wine): `VICTORY_NO_WRITE_WATCH=1` reserves without it. Wine
+        // watches writes by write-protecting pages (userfaultfd); every
+        // asking's reset makes the AMD driver revalidate the card's mappings
+        // of that memory, and each asking waits on Wine's memory lock (about
+        // 1.4 ms, ~950 a frame). Unwatched memory is refreshed whole instead.
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && !no_write_watch() {
             kind |= MEM_WRITE_WATCH;
         }
     }

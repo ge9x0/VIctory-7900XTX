@@ -107,6 +107,8 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
+    pub const ATOMIC_INT64_HEAP: u64 = 1 << 33;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -873,6 +875,8 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        self.m.unify_latches();
+        self.m.unify_returns();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
@@ -911,6 +915,12 @@ impl Shader {
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
+            features |= 0x80_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_HEAP != 0 {
+            features |= 0x1000_0000;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;

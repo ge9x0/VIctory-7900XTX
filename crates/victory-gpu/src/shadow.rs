@@ -2000,6 +2000,32 @@ impl Drop for Compared {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
+/// Eight bytes at `i` as one number.
+#[inline(always)]
+fn word(b: &[u8], i: usize) -> u64 {
+    u64::from_ne_bytes(b[i..i + 8].try_into().expect("eight bytes"))
+}
+
+/// Whether two byte slices are equal. Local (Wine): slice equality calls Wine's
+/// ucrtbase `memcmp`, a byte at a time; this compares 32 bytes a step.
+pub(crate) fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let (ca, cb) = (a.chunks_exact(32), b.chunks_exact(32));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        let mut d = 0u64;
+        for k in 0..4 {
+            d |= word(x, k * 8) ^ word(y, k * 8);
+        }
+        if d != 0 {
+            return false;
+        }
+    }
+    ra.iter().zip(rb).all(|(x, y)| x == y)
+}
+
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
@@ -2010,7 +2036,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         while i + 512 <= n && now[i..i + 512] == was[i..i + 512] {
             i += 512;
         }
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        while i + 8 <= n && word(now, i) == word(was, i) {
             i += 8;
         }
         while i < n && now[i] == was[i] {
@@ -2504,7 +2530,7 @@ mod merge_tests {
         let eights = || {
             let (now, was) = (std::hint::black_box(&a), std::hint::black_box(&b));
             let mut i = 0;
-            while i + 8 <= now.len() && now[i..i + 8] == was[i..i + 8] {
+            while i + 8 <= now.len() && word(now, i) == word(was, i) {
                 i += 8;
             }
             std::hint::black_box(i);
@@ -3441,7 +3467,7 @@ impl Shadow {
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
                 let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                if !same_bytes(host, &before[at - from..at - from + n]) {
                     found.push((at, n));
                 }
                 at += n;

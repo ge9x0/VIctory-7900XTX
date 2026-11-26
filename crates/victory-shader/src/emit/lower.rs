@@ -389,6 +389,12 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Local: loops whose back edges are all unconditional and that have a
+    /// conditional exit: the header and which blocks are in the loop. Their
+    /// limit is tested on those exits (the loop leaves as its code does),
+    /// not by a jump to `abort` from the latch, which leaves every enclosing
+    /// loop at once and which dxil-spirv cannot structurize.
+    capped: HashMap<usize, Vec<bool>>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -399,6 +405,12 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// Local: see the unconditional back edge in `exit`.
+fn no_loop_abort() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("VICTORY_NO_LOOP_ABORT").is_ok_and(|v| v.trim() == "1"))
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1721,6 +1733,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            capped: HashMap::new(),
             abort: None,
         }
     }
@@ -2356,6 +2369,12 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+            }
+        }
+        let headers: Vec<usize> = self.counters.keys().copied().collect();
+        for h in headers {
+            if let Some(body) = self.cappable(h) {
+                self.capped.insert(h, body);
             }
         }
         self.cur = self.s.entry;
@@ -12387,7 +12406,19 @@ impl<'a> Lower<'a> {
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
+            LaneExit::Jump(t) if self.capped.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
+                // The count goes on; the loop's exits test it.
+                let _ = self.count_iteration(t, pred::IUGE);
+                Term::Br(self.block[t].expect("reachable"))
+            }
+            // Local: VICTORY_NO_LOOP_ABORT=1 keeps an unconditional back edge plain. Its LOOP_LIMIT
+            // abort leaves every enclosing loop at once, which dxil-spirv (vkd3d-proton) cannot
+            // structurize ("no candidate for ladder merging").
+            LaneExit::Jump(t)
+                if self.counters.contains_key(&t)
+                    && self.rpo[t] <= self.rpo[b]
+                    && !no_loop_abort() =>
+            {
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
@@ -12434,6 +12465,7 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                let cond = self.cap_exits(b, cond, taken, not_taken);
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -12464,6 +12496,77 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
+    }
+
+    /// Local: the blocks of the natural loop of header `h`, if all its back
+    /// edges are unconditional jumps and a conditional branch leaves it.
+    fn cappable(&self, h: usize) -> Option<Vec<bool>> {
+        let p = &self.x.p;
+        let latches: Vec<usize> = p.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+            .collect();
+        if latches.is_empty() || latches.iter().any(|&q| self.x.st.exits[q] != LaneExit::Jump(h)) {
+            return None;
+        }
+        let mut inside = vec![false; p.blocks.len()];
+        inside[h] = true;
+        let mut work = latches;
+        while let Some(q) = work.pop() {
+            if std::mem::replace(&mut inside[q], true) {
+                continue;
+            }
+            for &r in &p.blocks[q].preds {
+                if self.block[r].is_some() && !inside[r] {
+                    work.push(r);
+                }
+            }
+        }
+        let leaves = (0..inside.len()).any(|b| {
+            inside[b]
+                && matches!(self.x.st.exits[b], LaneExit::Branch { taken, not_taken, .. }
+                    if !inside[taken] || !inside[not_taken])
+        });
+        leaves.then_some(inside)
+    }
+
+    /// Local: a branch of block `b` that leaves a capped loop also leaves
+    /// it once the loop's count reaches the limit (see `capped`).
+    fn cap_exits(&mut self, b: usize, mut cond: V, taken: usize, not_taken: usize) -> V {
+        let mut loops: Vec<(usize, bool)> = self
+            .capped
+            .iter()
+            .filter(|(_, body)| body[b] && body[taken] != body[not_taken])
+            .map(|(&h, body)| (h, !body[taken]))
+            .collect();
+        loops.sort_unstable();
+        for (h, out_when_taken) in loops {
+            let (phi, _) = self.counters[&h];
+            let lim = self.limit();
+            let limit = self.s.m.i32(lim);
+            if out_when_taken {
+                let over = self.s.m.cmp(self.cur, pred::IUGE, phi, limit);
+                self.s.m.tag(over, Tag::Counter);
+                cond = self.s.m.bin(self.cur, Bin::Or, cond, over);
+            } else {
+                let ok = self.s.m.cmp(self.cur, pred::IULT, phi, limit);
+                self.s.m.tag(ok, Tag::Counter);
+                cond = self.s.m.bin(self.cur, Bin::And, cond, ok);
+            }
+        }
+        cond
+    }
+
+    /// The iteration limit of this stage (see [`count_iteration`]).
+    fn limit(&self) -> u32 {
+        match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        }
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts

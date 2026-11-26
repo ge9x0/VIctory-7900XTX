@@ -38,7 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -1395,7 +1395,7 @@ pub(crate) fn compile(
     let bytes = unsafe {
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
     };
-    Ok(bytes.to_vec())
+    Ok(rootsig::with_root(source, bytes.to_vec()))
 }
 
 impl PlanePass {
@@ -3686,6 +3686,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod rootsig;
 mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -4214,7 +4215,11 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let fixed = rootsig::with_root(
+                CARD_COMPARE,
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()).to_vec(),
+            );
+            let bytes = &fixed[..];
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),

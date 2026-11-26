@@ -466,6 +466,26 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Whether `at` is code of kernel32.dll or kernelbase.dll (where `IsBadReadPtr` runs).
+unsafe fn in_probe_module(at: usize) -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleA, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: plain lookups; the flags keep the reference count unchanged.
+    unsafe {
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        ) == 0
+        {
+            return false;
+        }
+        module == GetModuleHandleA(c"kernel32.dll".as_ptr().cast()) || module == GetModuleHandleA(c"kernelbase.dll".as_ptr().cast())
+    }
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -481,7 +501,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    // Local (Wine): `IsBadReadPtr` (the GPU layer's probe of title memory)
+    // faults inside kernel32/kernelbase on a page that is not there and
+    // handles it itself; reporting each (a stack walk and memory queries)
+    // made loading crawl. Unhandled ones are still reported below.
+    // SAFETY: as above.
+    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode })
+        && !unsafe { in_probe_module((*(*info).ExceptionRecord).ExceptionAddress as usize) }
+    {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }

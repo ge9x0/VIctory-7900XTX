@@ -1,2 +1,3 @@
-[alias]
-xtask = "run --quiet --package xtask --"
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = ["-Lnative=/home/v1per/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/lib/x64", "-Lnative=/home/v1per/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/um/x64", "-Lnative=/home/v1per/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/ucrt/x64"]

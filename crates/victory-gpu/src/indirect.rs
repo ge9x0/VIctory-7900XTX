@@ -55,12 +55,12 @@ cbuffer Record : register(b0) {
     uint has_count;
     uint count_offset;
 };
-ByteAddressBuffer src_args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+StructuredBuffer<uint> src_args : register(t0);
+StructuredBuffer<uint> count_buf : register(t1);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -83,7 +83,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
+        eff_count = min(eff_count, count_buf[(count_offset) / 4]);
     }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
@@ -100,7 +100,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint2 want = src_args.Load2(src_at);
+        uint2 want = uint2(src_args[(src_at) / 4], src_args[(src_at) / 4 + 1]);
         if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
             want = uint2(0, 0);
         }
@@ -116,7 +116,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = src_args.Load3(src_at);
+        uint3 g = uint3(src_args[(src_at) / 4], src_args[(src_at) / 4 + 1], src_args[(src_at) / 4 + 2]);
         // Up to WIDEST groups in x run as asked (`widest`).
         g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
         // x * y fits 32 bits where it is looked at; the whole count may not.
@@ -127,7 +127,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         groups = g;
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
+        uint3 g = uint3(src_args[(src_at) / 4], src_args[(src_at) / 4 + 1], src_args[(src_at) / 4 + 2]);
         // A record over the most a dispatch runs is a slot the title has
         // not filled (the title leaves all ones there): empty,
         // and not counted below either. (65,535 groups of meshlets read
@@ -161,8 +161,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[(0) / 4], 0, before);
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -173,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[(0) / 4], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -195,17 +194,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[(12) / 4], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[(16) / 4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[(4) / 4], largest_asked, was);
+        InterlockedAdd(budget[(8) / 4], all_asked, was);
     }
     if (!active) {
         return;
@@ -215,17 +214,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        { uint2 v2 = draw_counts; dst_args[(dst_at) / 4] = v2.x; dst_args[(dst_at) / 4 + 1] = v2.y; }
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[(dst_at + off) / 4] = src_args[(src_at + off) / 4];
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        { uint3 _v = groups; dst_args[(dst_at) / 4] = _v.x; dst_args[(dst_at) / 4 + 1] = _v.y; dst_args[(dst_at) / 4 + 2] = _v.z; };
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[(dst_at + off) / 4] = src_args[(src_at + off) / 4];
         }
     }
 }
@@ -345,7 +344,26 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        // Local (Wine): vkd3d's HLSL compiler leaves the [RootSignature] attribute out of the
+        // blob; then the same signature is serialized from its description.
+        let root: ID3D12RootSignature = match device.CreateRootSignature(0, bytes) {
+            Ok(r) => r,
+            Err(_) => {
+                let params = [
+                    D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 6 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+                    D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+                    D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+                    D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+                    D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+                ];
+                let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), ..Default::default() };
+                let mut blob: Option<ID3DBlob> = None;
+                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+                let blob = blob.ok_or_else(windows::core::Error::empty)?;
+                let rs = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+                device.CreateRootSignature(0, rs)?
+            }
+        };
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -641,12 +659,12 @@ pub(crate) mod tests {
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
-RWByteAddressBuffer hits : register(u0);
+RWStructuredBuffer<uint> hits : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
-    hits.InterlockedAdd(0, 1, prev);
+    InterlockedAdd(hits[(0) / 4], 1, prev);
 }
 "#;
 
@@ -1034,14 +1052,14 @@ cbuffer C : register(b0) { uint which; uint first; uint step; uint at; }
 ByteAddressBuffer v[8] : register(t0);
 struct Block { uint4 d[4096]; };
 ConstantBuffer<Block> c[8] : register(b1);
-RWByteAddressBuffer o : register(u0);
+RWStructuredBuffer<uint> o : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
-    if (step == 0) { if (id.x == 0) o.Store(at, v[which].Load(first)); }
-    else if (step == 1) { if (id.x == 0) o.Store(at, c[which].d[first / 16][(first / 4) & 3]); }
-    else if (step == 16) { o.Store(at + id.x * 4, c[which].d[first / 16 + id.x][(first / 4) & 3]); }
-    else { o.Store(at + id.x * 4, v[which].Load(first + id.x * step)); }
+    if (step == 0) { if (id.x == 0) o[(at) / 4] = v[which].Load(first); }
+    else if (step == 1) { if (id.x == 0) o[(at) / 4] = c[which].d[first / 16][(first / 4) & 3]; }
+    else if (step == 16) { o[(at + id.x * 4) / 4] = c[which].d[first / 16 + id.x][(first / 4) & 3]; }
+    else { o[(at + id.x * 4) / 4] = v[which].Load(first + id.x * step); }
 }
 "#;
         let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
@@ -1203,7 +1221,7 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
 #define RS "RootConstants(num32BitConstants=1,b0), DescriptorTable(SRV(t0,numDescriptors=2,flags=DESCRIPTORS_VOLATILE)), UAV(u0)"
 cbuffer C : register(b0) { uint odd; }
 Texture2D<float4> t[2] : register(t0);
-RWByteAddressBuffer o : register(u0);
+RWStructuredBuffer<uint> o : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
@@ -1215,8 +1233,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     uint kind = (w == 64 && h == 64) ? (r == 17 ? 0 : 3) : (w == 2048 && h == 2048) ? (r == 34 ? 1 : 4) : 2;
     if (i == 0) {
         uint was;
-        o.InterlockedAdd(kind * 4, 1, was);
-        if (kind > 1) { o.Store(32, w); o.Store(36, h); o.Store(40, r); }
+        InterlockedAdd(o[(kind * 4) / 4], 1, was);
+        if (kind > 1) { o[(32) / 4] = w; o[(36) / 4] = h; o[(40) / 4] = r; }
     }
 }
 "#;
@@ -1449,7 +1467,7 @@ Texture2DArray<float4> layers : register(t1);
 Texture3D<float4> volume : register(t2);
 TextureCubeArray<float4> cube : register(t3);
 SamplerState s : register(s0);
-RWByteAddressBuffer o : register(u0);
+RWStructuredBuffer<uint> o : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 t : SV_DispatchThreadID) {
@@ -1464,8 +1482,8 @@ void main(uint3 t : SV_DispatchThreadID) {
     if (how == 6) c = flat_.Load(int3(at, far));
     uint r = (uint)(c.x * 255.0 + 0.5), was;
     // the texture's own bytes, zeros, anything else
-    o.InterlockedAdd(r == 17 ? 0 : r == 0 ? 4 : 8, 1, was);
-    if (r != 17 && r != 0) o.Store(12, r);
+    InterlockedAdd(o[(r == 17 ? 0 : r == 0 ? 4 : 8) / 4], 1, was);
+    if (r != 17 && r != 0) o[(12) / 4] = r;
 }
 "#;
         let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
@@ -1606,20 +1624,20 @@ void main(uint3 t : SV_DispatchThreadID) {
         const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=4),CBV(b1)), UAV(u0), StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_LINEAR,addressU=TEXTURE_ADDRESS_WRAP,addressV=TEXTURE_ADDRESS_WRAP)"
 cbuffer C : register(b0) { uint how; uint far; uint lane; uint out_at; }
-ByteAddressBuffer raw : register(t0);
+StructuredBuffer<uint> raw : register(t0);
 Buffer<float4> typed : register(t1);
 Texture2D<float4> tex : register(t2);
 struct Block { uint4 d[4096]; };
 ConstantBuffer<Block> block : register(b1);
 SamplerState s : register(s0);
-RWByteAddressBuffer o : register(u0);
+RWStructuredBuffer<uint> o : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 t : SV_DispatchThreadID) {
     uint at = far + t.x * lane * 4;
     float4 c = 0;
-    if (how == 0) c = asfloat(raw.Load4(at));
-    if (how == 1) c = asfloat(raw.Load(at + 4092));
+    if (how == 0) c = asfloat(uint4(raw[(at) / 4], raw[(at) / 4 + 1], raw[(at) / 4 + 2], raw[(at) / 4 + 3]));
+    if (how == 1) c = asfloat(raw[(at + 4092) / 4]);
     if (how == 2) c = typed.Load(at);
     if (how == 3) c = asfloat(block.d[at]);
     if (how == 4) c = tex.Load(int3(at, 0, 0));
@@ -1628,7 +1646,7 @@ void main(uint3 t : SV_DispatchThreadID) {
     if (how == 7) c = tex.SampleLevel(s, float2(0.5, 0.5), asfloat(at));
     if (how == 8) c = tex.SampleGrad(s, float2(0.5, 0.5), asfloat(at).xx, asfloat(at).xx);
     uint was;
-    o.InterlockedAdd(any(asuint(c) != 0) ? 4 : 0, 1, was);
+    InterlockedAdd(o[(any(asuint(c) != 0) ? 4 : 0) / 4], 1, was);
 }
 "#;
         let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
@@ -1810,7 +1828,7 @@ void main(uint3 t : SV_DispatchThreadID) {
         const SOURCE: &str = r#"
 #define RS "DescriptorTable(SRV(t0,numDescriptors=64,flags=DESCRIPTORS_VOLATILE|DATA_VOLATILE)), UAV(u0)"
 Texture2D<float4> t[64] : register(t0);
-RWByteAddressBuffer o : register(u0);
+RWStructuredBuffer<uint> o : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
@@ -1818,7 +1836,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     float4 c = 0;
     for (uint k = 0; k < 8; k++)
         c += t[(which + k * 8) & 63].Load(int3((i + k * 13) & 127, (g.y + k * 29) & 255, 0));
-    if (c.x < -1) o.Store(0, 1);
+    if (c.x < -1) o[(0) / 4] = 1;
 }
 "#;
         let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
@@ -2967,15 +2985,15 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
 #define RS "UAV(u0)"
-RWByteAddressBuffer seen : register(u0);
+RWStructuredBuffer<uint> seen : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     uint was;
-    seen.InterlockedAdd(0, 1, was);
-    seen.InterlockedMax(4, group.x, was);
-    seen.InterlockedMax(8, thread.x, was);
-    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+    InterlockedAdd(seen[(0) / 4], 1, was);
+    InterlockedMax(seen[(4) / 4], group.x, was);
+    InterlockedMax(seen[(8) / 4], thread.x, was);
+    InterlockedAdd(seen[(16 + group.x * 4) / 4], 1, was);
 }
 "#;
         let Some(mut gpu) = WarpHarness::on(false) else {
@@ -3379,11 +3397,11 @@ float4 second(float4 at : SV_Position) : SV_Target {
     /// record is: one group of one thread that writes one word.
     const WORK: &str = r#"
 #define RS "UAV(u0)"
-RWByteAddressBuffer words : register(u0);
+RWStructuredBuffer<uint> words : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void work() {
-    words.Store(0, words.Load(0) + 1);
+    words[(0) / 4] = words[(0) / 4] + 1;
 }
 "#;
 

@@ -27,7 +27,15 @@ pub struct PreparedImage {
 impl PreparedImage {
     /// File name for the patched copy, unique per original build.
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        // Local: a patched copy gets its own name.
+        match std::env::var("VICTORY_PATCH") {
+            Ok(p) if !p.trim().is_empty() => format!(
+                "victory-image-{}-{}.dll",
+                &self.original_hash.to_hex()[..16],
+                &blake3::hash(p.as_bytes()).to_hex()[..8]
+            ),
+            _ => format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16]),
+        }
     }
 }
 
@@ -102,6 +110,37 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+            }
+        }
+    }
+
+    // Local: VICTORY_PATCH=rva:oldhex>newhex,... rewrites bytes of the copy when the
+    // old bytes match (e.g. the title's thread-stall watchdog limit while it loads).
+    if let Ok(list) = std::env::var("VICTORY_PATCH") {
+        for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let parsed = entry.split_once(':').and_then(|(rva, rest)| {
+                let (old, new) = rest.split_once('>')?;
+                let hex = |h: &str| -> Option<Vec<u8>> {
+                    (0..h.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok())
+                        .collect()
+                };
+                Some((u32::from_str_radix(rva.trim_start_matches("0x"), 16).ok()?, hex(old)?, hex(new)?))
+            });
+            let Some((rva, old, new)) = parsed.filter(|(_, o, n)| o.len() == n.len()) else {
+                eprintln!("VICTORY_PATCH: bad entry {entry:?}");
+                continue;
+            };
+            let Some(at) = info.rva_to_file_offset(rva).map(|a| a as usize) else {
+                eprintln!("VICTORY_PATCH: rva {rva:#x} is not file-backed");
+                continue;
+            };
+            if bytes.get(at..at + old.len()) == Some(&old[..]) {
+                bytes[at..at + new.len()].copy_from_slice(&new);
+                eprintln!("VICTORY_PATCH: patched rva {rva:#x}");
+            } else {
+                eprintln!("VICTORY_PATCH: rva {rva:#x} does not hold the expected bytes; skipped");
             }
         }
     }

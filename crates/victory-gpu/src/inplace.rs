@@ -120,8 +120,41 @@ pub(crate) struct Placed {
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    if views_in_place() && cover(at as usize, bytes as usize) != Cover::None {
+        if !views_tiled() {
+            return Err(None);
+        }
+        return place_tiled(device, start, at, bytes);
+    }
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
+    }
+    // Local: private memory too through 64 MiB chunk heaps opened once, so a
+    // few dozen host allocations stand instead of one per buffer (each one
+    // is revalidated by the kernel at every submission).
+    if views_in_place() {
+        let c0 = at & !(chunk_bytes() - 1);
+        if at + bytes <= c0 + chunk_bytes() && private_whole(c0 as usize, chunk_bytes() as usize) {
+            let heap = {
+                let mut t = tiled();
+                match t.private.get(&c0) {
+                    Some(h) => Some(h.clone()),
+                    None => match open(device, From::Part(c0 as usize, chunk_bytes() as usize)) {
+                        Ok(h) => {
+                            t.private.insert(c0, h.clone());
+                            Some(h)
+                        }
+                        Err(_) => None,
+                    },
+                }
+            };
+            if let Some(heap) = heap {
+                let buffer = place(device, &heap, at - c0, bytes).map_err(Some)?;
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+                return Ok(Placed { buffer, heap, gpu, bias: start - at });
+            }
+        }
     }
     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
@@ -137,8 +170,23 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    // View memory: known from the runtime without asking Windows. With
+    // `VICTORY_INPLACE_VIEWS=1`, a window inside one run of a committed
+    // section is opened over its view's pages (a part of the view, so only
+    // the pages it shows are locked); a remap lets it go (`watch.rs`).
+    let cov = cover(start as usize, len as usize);
+    // Any view memory: its pages are tiled in from their sections.
+    let view_run = views_tiled();
+    if cov != Cover::None && !view_run && views_in_place() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 24 {
+            let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            unsafe { mem::VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
+            let kind = match cov { Cover::Holes => "holes".to_owned(), Cover::Scattered => "scattered".to_owned(), Cover::Run(s, o) => format!("run {s:#x}+{o:#x} committed {}", section_committed(s)), Cover::None => "none".to_owned() };
+            tracing::warn!(start = format_args!("{start:#x}"), len, kind, region = format_args!("{:#x}+{:#x}", info.BaseAddress as usize, info.RegionSize), state = info.State, ty = info.Type, protect = info.Protect, "view window not in place");
+        }
+    }
+    if cov != Cover::None && !view_run {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -156,6 +204,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if !window && SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+                let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                unsafe { mem::VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
+                tracing::warn!(start = format_args!("{start:#x}"), len, cover = ?cover(start as usize, len as usize) != Cover::None,
+                    region = format_args!("{:#x}+{:#x}", info.BaseAddress as usize, info.RegionSize), state = info.State, ty = info.Type, protect = info.Protect,
+                    "title buffer not in place");
+            }
             None
         }
         Err(Some(e)) => {
@@ -523,6 +579,155 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// `VICTORY_INPLACE_VIEWS=1`: page-pool windows in place too (local; needs
+/// amdgpu to import shared pages: tools/anon-shim on Linux).
+pub(crate) fn views_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_INPLACE_VIEWS=2`: private chunk heaps only; view memory is copied.
+fn views_tiled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+fn section_committed(section: usize) -> bool {
+    views().sections.iter().any(|s| s.0 == section && s.2)
+}
+
+/// Bytes of a section opened as one heap at a time, from our own view of
+/// the whole section (opening locks the chunk's pages, only them).
+/// `VICTORY_INPLACE_CHUNK_MB` (default 4): amdgpu walks every page of every
+/// imported allocation at each submission, so chunks stay small.
+fn chunk_bytes() -> u64 {
+    static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("VICTORY_INPLACE_CHUNK_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4).clamp(1, 256).next_power_of_two() << 20)
+}
+
+struct Tiled {
+    /// By section: our view of all of it, the heaps of its chunks.
+    sections: std::collections::HashMap<usize, (usize, std::collections::HashMap<u64, ID3D12Heap>)>,
+    fence: Option<(ID3D12Fence, u64)>,
+    /// Private memory: heaps of 64 MiB chunks, by the chunk's address.
+    private: std::collections::HashMap<u64, ID3D12Heap>,
+}
+// SAFETY: COM objects of the free-threaded runtime, behind the lock.
+unsafe impl Send for Tiled {}
+
+fn tiled() -> std::sync::MutexGuard<'static, Tiled> {
+    static T: std::sync::OnceLock<std::sync::Mutex<Tiled>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(Tiled { sections: Default::default(), fence: None, private: Default::default() })).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn chunk_heap(device: &ID3D12Device, t: &mut Tiled, section: usize, chunk: u64) -> Option<ID3D12Heap> {
+    let bytes = views().sections.iter().find(|s| s.0 == section && s.2)?.1;
+    let entry = match t.sections.entry(section) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // SAFETY: a live committed section; the view is kept for good.
+            let view = unsafe { mem::MapViewOfFile(section as windows_sys::Win32::Foundation::HANDLE, mem::FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+            if view.Value.is_null() {
+                return None;
+            }
+            e.insert((view.Value as usize, Default::default()))
+        }
+    };
+    if let Some(heap) = entry.1.get(&chunk) {
+        return Some(heap.clone());
+    }
+    let from = chunk * chunk_bytes();
+    let len = chunk_bytes().min(bytes.checked_sub(from)?);
+    match open(device, From::Part(entry.0 + from as usize, len as usize)) {
+        Ok(heap) => {
+            entry.1.insert(chunk, heap.clone());
+            Some(heap)
+        }
+        Err(e) => {
+            tracing::warn!(section = format_args!("{section:#x}"), chunk, error = %e, "a chunk of a section not opened");
+            None
+        }
+    }
+}
+
+/// View memory `[at, at + bytes)` (64 KiB pages) as a reserved buffer whose
+/// tiles are the title's physical pages, each from its section's heap;
+/// pages no view shows stay unmapped.
+fn place_tiled(device: &ID3D12Device, start: u64, at: u64, bytes: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let host = crate::host::host().ok_or(None)?;
+    let pages: Vec<Option<(usize, u64)>> = {
+        let v = views();
+        (0..bytes / K64 as u64)
+            .map(|k| {
+                let p = at as usize + k as usize * K64;
+                let (&base, &(len, section, offset)) = v.views.range(..=p).next_back()?;
+                (p < base + len).then(|| (section, offset + (p - base) as u64))
+            })
+            .collect()
+    };
+    if pages.iter().all(Option::is_none) {
+        return Err(None);
+    }
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    unsafe {
+        device
+            .CreateReservedResource(&buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+            .map_err(Some)?
+    };
+    let buffer = buffer.ok_or(None)?;
+    let mut t = tiled();
+    let mut first: Option<ID3D12Heap> = None;
+    for (k, page) in pages.iter().enumerate() {
+        let Some((section, offset)) = *page else { continue };
+        let heap = chunk_heap(device, &mut t, section, offset / chunk_bytes()).ok_or(None)?;
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: k as u32, Y: 0, Z: 0, Subresource: 0 };
+        let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 };
+        let tile = ((offset % chunk_bytes()) / K64 as u64) as u32;
+        let one = 1u32;
+        // SAFETY: arrays of one, live objects.
+        unsafe {
+            host.queue.UpdateTileMappings(&buffer, 1, Some(&coord), Some(&size), &heap, 1, None, Some(&tile), Some(&one), D3D12_TILE_MAPPING_FLAG_NONE)
+        };
+        first.get_or_insert(heap);
+    }
+    // The mappings done before any list uses the buffer.
+    if t.fence.is_none() {
+        // SAFETY: plain creation.
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.map_err(Some)?;
+        t.fence = Some((fence, 0));
+    }
+    let (fence, value) = t.fence.as_mut().ok_or(None)?;
+    *value += 1;
+    // SAFETY: live fence and queue; an event of our own.
+    unsafe {
+        host.queue.Signal(&*fence, *value).map_err(Some)?;
+        if fence.GetCompletedValue() < *value {
+            let event = CreateEventW(None, false, false, None).map_err(Some)?;
+            fence.SetEventOnCompletion(*value, event).map_err(Some)?;
+            WaitForSingleObject(event, 5000);
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+        }
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Placed { buffer, heap: first.ok_or(None)?, gpu, bias: start - at })
+}
+
+/// Whether `[at, at + len)` lies in one mapped view, committed and
+/// read-write.
+pub(crate) fn view_whole(at: usize, len: usize) -> bool {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == mem::MEM_COMMIT
+        && info.Type == mem::MEM_MAPPED
+        && info.Protect == mem::PAGE_READWRITE
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }
 
 /// Another address of the title memory `[at, at + len)`, if it is a view of

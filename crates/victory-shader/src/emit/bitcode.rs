@@ -500,6 +500,120 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Local diagnostics: the block graph and each block's instructions, as text.
+    pub fn cfg_text(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            let _ = writeln!(out, "b{b}: term={:?}", blk.term);
+            for &i in blk.phis.iter().chain(&blk.body) {
+                match &self.insts[i as usize].op {
+                    Op::Call(f, args) => {
+                        let code = match args.first() {
+                            Some(V::Const(c)) => format!("{:?}", self.consts[*c as usize].1),
+                            _ => String::new(),
+                        };
+                        let _ = writeln!(out, "  %{i} = call {} {code} {:?}", self.funcs[*f as usize].name, &args[1.min(args.len())..]);
+                    }
+                    op => {
+                        let _ = writeln!(out, "  %{i} = {op:?}");
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Local (Linux/vkd3d-proton): every loop header gets one latch, as LLVM's
+    /// LoopSimplify leaves DXC's loops. Console code can jump back to a
+    /// loop's start from several places; dxil-spirv then finds no merge for
+    /// the extra back edge and crashes (`find_common_post_dominator` on null).
+    /// Back edges into a header with two or more of them go through a new
+    /// block that takes over their phi inputs.
+    pub fn unify_latches(&mut self) {
+        let n = self.blocks.len();
+        let succs = |m: &Self, b: usize| {
+            let s = successors(m.blocks[b].term);
+            s.to[..s.len].to_vec()
+        };
+        // Back edges: to a block still on the depth-first stack.
+        let mut back: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut state = vec![0u8; n]; // 0 new, 1 on stack, 2 done
+        let mut stack = vec![(0usize, 0usize)];
+        state[0] = 1;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            let list = succs(self, b);
+            if let Some(&s) = list.get(*k) {
+                *k += 1;
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    1 => {
+                        if !back[s].contains(&b) {
+                            back[s].push(b);
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+        for header in 0..n {
+            let latches = std::mem::take(&mut back[header]);
+            if latches.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            // Phi inputs from the old latches move to phis of the new one.
+            for &p in &self.blocks[header].phis.clone() {
+                let ty = self.insts[p as usize].ty;
+                let Op::Phi(incoming) = self.insts[p as usize].op.clone() else { continue };
+                let (moved, kept): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|(_, from)| latches.contains(from));
+                let inner = self.phi(latch, ty);
+                self.set_phi(inner, moved);
+                let mut kept = kept;
+                kept.push((inner, latch));
+                self.insts[p as usize].op = Op::Phi(kept);
+            }
+            for &l in &latches {
+                let term = match self.blocks[l].term {
+                    Some(Term::Br(t)) if t == header => Term::Br(latch),
+                    Some(Term::CondBr(c, t, f)) => Term::CondBr(
+                        c,
+                        if t == header { latch } else { t },
+                        if f == header { latch } else { f },
+                    ),
+                    other => other.expect("a latch has a terminator"),
+                };
+                self.blocks[l].term = Some(term);
+            }
+            self.terminate(latch, Term::Br(header));
+        }
+    }
+
+    /// Local (Linux/vkd3d-proton): every `ret` goes through one shared exit
+    /// block, as DXC emits it. dxil-spirv cannot structurize a loop whose
+    /// exits end in different returns (e.g. the export path and the
+    /// LOOP_LIMIT discard path): "Failed to find a common merge point".
+    pub fn unify_returns(&mut self) {
+        let rets: Vec<usize> = (0..self.blocks.len())
+            .filter(|&b| matches!(self.blocks[b].term, Some(Term::Ret)))
+            .collect();
+        if rets.len() < 2 {
+            return;
+        }
+        let exit = self.new_block();
+        self.terminate(exit, Term::Ret);
+        for b in rets {
+            self.terminate(b, Term::Br(exit));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

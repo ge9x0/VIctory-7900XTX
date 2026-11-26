@@ -753,14 +753,14 @@ mod tests {
 Texture2D<float4> clamped : register(t0);
 Texture2D<float4> whole : register(t1);
 SamplerState nearest : register(s0);
-RWByteAddressBuffer words : register(u0);
+RWStructuredBuffer<uint> words : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void look() {
     float4 a = clamped.SampleLevel(nearest, float2(0.3, 0.3), 0);
     float4 b = whole.SampleLevel(nearest, float2(0.3, 0.3), 0);
-    words.Store(0, (uint)(a.x * 255.0 + 0.5));
-    words.Store(4, (uint)(b.x * 255.0 + 0.5));
+    words[(0) / 4] = (uint)(a.x * 255.0 + 0.5);
+    words[(4) / 4] = (uint)(b.x * 255.0 + 0.5);
 }
 "#;
 

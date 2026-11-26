@@ -574,7 +574,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -582,6 +582,21 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // Local (Wine): vkd3d-proton makes no library here, and the early list
+    // was then never written, so every run asked for every pipeline in play.
+    // vkd3d's and Mesa's own disk caches keep the compiled pipelines; the
+    // list alone lets the next run start them during loading.
+    let Some(library) = library() else {
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            let used: Vec<String> = used().iter().flatten().cloned().collect();
+            let _ = std::fs::create_dir_all(dir);
+            match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                Ok(()) => tracing::info!(early = used.len(), "title pipelines to start early saved (no library)"),
+                Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+            }
+        }
+        return;
+    };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
