@@ -199,7 +199,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -209,7 +209,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; uint slices;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -219,7 +219,7 @@ RWStructuredBuffer<float4> cells : register(u1);
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
 // what the title's resolve left, what was found and what was written.
-RWByteAddressBuffer stats : register(u3);
+RWStructuredBuffer<uint> stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -235,8 +235,8 @@ RWTexture2D<float3> radiance : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 4, 1)]
 void keep(uint3 at : SV_DispatchThreadID) {
-    uint w, h;
-    radiance.GetDimensions(w, h);
+    // (Not GetDimensions: Wine's HLSL compiler has none on RWTexture2D<float3>.)
+    uint w = width, h = height;
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
@@ -316,8 +316,7 @@ RWTexture3D<float3> scattered : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
-    uint w, h, d;
-    scattered.GetDimensions(w, h, d);
+    uint w = width, h = height, d = slices;
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
@@ -417,10 +416,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
-        stats.InterlockedAdd(0, 1, ignored);
-        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[0], 1, ignored);
+        InterlockedAdd(stats[1], uint(min(left, 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[2], uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[3], uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
     }
 }
 #endif
@@ -561,7 +560,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -574,6 +573,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = views.slices;
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -581,7 +581,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());

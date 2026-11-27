@@ -2318,7 +2318,14 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let baking = crate::texture::BAKING.get();
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        // `VICTORY_TEXTURE_SLOTS` (default 4096): due slots made per frame. At a few fps a
+        // scene's backlog (13,000 waiting at 1080p here) drains over many frames, so
+        // textures show late; a larger number drains it sooner (each costs CPU time).
+        static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let slots = *SLOTS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_SLOTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096usize).clamp(256, 1 << 16)
+        });
+        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { slots });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
@@ -4140,7 +4147,14 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            // Which part failed (the same checks `prepare_for` makes first).
+            if kind != DISPATCH && crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+                why("prepare failed: no host pipeline (not made, failed, or not given)");
+            } else if kind != DISPATCH && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.compute || p.mesh != (kind == MESH)) {
+                why("prepare failed: another kind of pipeline");
+            } else {
+                why("prepare failed: binding (tables, index buffer or roots)");
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]

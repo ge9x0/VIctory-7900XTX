@@ -19,14 +19,12 @@ Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -56,6 +54,7 @@ unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
@@ -70,8 +69,14 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut errors),
+        )
+        .inspect_err(|_| {
+            if let Some(e) = &errors {
+                let text = std::slice::from_raw_parts(e.GetBufferPointer().cast::<u8>(), e.GetBufferSize());
+                tracing::warn!("two-plane composer shader: {}", String::from_utf8_lossy(text));
+            }
+        })?;
     }
     code.ok_or_else(windows::core::Error::empty)
 }
@@ -88,7 +93,46 @@ impl Composer {
                 std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
             };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            // The root signature is made here, not taken from the shader: Wine's HLSL
+            // compiler (vkd3d-shader) failed on this one (Series S showed a black screen).
+            let _ = bytes;
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let params = [D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            }];
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            };
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+            let blob = blob.ok_or_else(windows::core::Error::empty)?;
+            let root: ID3D12RootSignature = device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+            )?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

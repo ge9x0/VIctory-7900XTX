@@ -388,6 +388,27 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // `VICTORY_UNKNOWN_DUMP=<folder>`: the bytes each (pointer, size) pair of
+        // the description names, and 1 KiB at each other pointer, one file each,
+        // so that the description's layout can be worked out offline.
+        #[cfg(windows)]
+        if let (Some(dir), Some(w)) = (std::env::var_os("VICTORY_UNKNOWN_DUMP"), description.as_ref()) {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let tag = format!("{:x}-{calls}", SLOT);
+            let _ = std::fs::write(dir.join(format!("{tag}-desc.bin")), w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            for i in 0..w.len() {
+                let (at, next) = (w[i] as usize, w.get(i + 1).copied().unwrap_or(0) as usize);
+                if at < 0x10000 || at >> 47 != 0 {
+                    continue;
+                }
+                let len = if next > 0 && next <= 0x100000 { next } else { 1024 };
+                let mut bytes = vec![0u8; len];
+                if crate::host::read_into(at as *const u8, &mut bytes) {
+                    let _ = std::fs::write(dir.join(format!("{tag}-w{i:02}-{at:x}.bin")), &bytes);
+                }
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
